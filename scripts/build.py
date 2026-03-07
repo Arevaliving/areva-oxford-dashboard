@@ -111,7 +111,7 @@ def sftp_sync():
 # ── Step 2: Load meter map ─────────────────────────────────────────────────────
 def load_meter_map():
     if not METER_MAP.exists():
-        log.error(f"Meter map not found at {METERE_MAP}")
+        log.error(f"Meter map not found at {METER_MAP}")
         return {}, {}
     with open(METER_MAP) as f:
         meter_list = json.load(f)
@@ -121,3 +121,201 @@ def load_meter_map():
         serial_to_unit[u["dc_s"]] = (u["u"], "dc")
     log.info(f"Meter map: {len(meter_list)} units, {len(serial_to_unit)} serials")
     return meter_list, serial_to_unit
+
+# ── Step 3: Parse all CSVs ────────────────────────────────────────────────────
+def parse_csvs(serial_to_unit):
+    """Returns:
+       snapshot_data: serial -> {snap_date_str: cumulative_value}  (from meter snapshots)
+       daily_data:    serial -> {date_str: cumulative_value}        (from file timestamps)
+    """
+    snapshot_data = defaultdict(dict)   # from columns 15-30
+    daily_data    = defaultdict(dict)   # from file date + col 13
+
+    files = sorted(ARCHIVE_DIR.glob("*.csv"))
+    log.info(f"Parsing {len(files)} CSV files...")
+
+    for fpath in files:
+        fdate = file_date(fpath.name)
+
+        with open(fpath, encoding="utf-8", errors="replace") as f:
+            reader = csv.reader(f, delimiter=";")
+            for row in reader:
+                if len(row) < 31 or row[0] == "#serial-number":
+                    continue
+                serial = str(row[COL_SERIAL]).strip()
+                if serial not in serial_to_unit:
+                    continue
+
+                # Current cumulative (for daily timeline)
+                cur_val = parse_float(row[COL_CUR_VAL])
+                if cur_val is not None and fdate:
+                    dstr = str(fdate)
+                    # Take max value seen on this date (latest file wins)
+                    if dstr not in daily_data[serial] or cur_val > daily_data[serial][dstr]:
+                        daily_data[serial][dstr] = cur_val
+
+                # Snapshot pairs (historical monthly snapshots)
+                for val_col, date_col in SNAP_PAIRS:
+                    if val_col >= len(row) or date_col >= len(row):
+                        continue
+                    snap_val  = parse_float(row[val_col])
+                    snap_date = str(row[date_col]).strip()[:10]  # YYYY-MM-DD
+                    if snap_val is not None and re.match(r"\d{4}-\d{2}-\d{2}", snap_date):
+                        # Keep max value seen for this snap_date
+                        if snap_date not in snapshot_data[serial] or snap_val > snapshot_data[serial][snap_date]:
+                            snapshot_data[serial][snap_date] = snap_val
+
+    log.info(f"  snapshot_data: {len(snapshot_data)} serials")
+    log.info(f"  daily_data:    {len(daily_data)} serials")
+    return snapshot_data, daily_data
+
+# ── Step 4: Compute unit data ─────────────────────────────────────────────────
+KNOWN_SNAP_DATES = [
+    "2025-09-30",  # 0 baseline
+    "2025-10-31",  # 1
+    "2025-11-30",  # 2
+    "2025-12-31",  # 3
+    "2026-01-01",  # 4 YTD start
+    "2026-01-31",  # 5
+    "2026-02-28",  # 6
+]
+MONTHS_LABELS = ["Oct '25", "Nov '25", "Dec '25", "Jan '26", "Feb '26"]
+
+def build_unit_data(meter_list, serial_to_unit, snapshot_data, daily_data):
+    today = date.today()
+    current_month_snap = str(today)  # latest file date = MTD snapshot
+
+    units_out = []
+    for u in meter_list:
+        uid = u["u"]
+        dh_s = u["dh_s"]
+        dc_s = u["dc_s"]
+
+        # Collect snapshots for this unit
+        def get_snaps(serial):
+            snaps = snapshot_data.get(serial, {})
+            daily = daily_data.get(serial, {})
+            result = []
+            for d in KNOWN_SNAP_DATES:
+                result.append(snaps.get(d) or daily.get(d))
+
+            # Add current MTD: latest daily reading
+            if daily:
+                latest_date = max(daily.keys())
+                result.append(daily[latest_date])
+            else:
+                result.append(None)
+
+            return result, (max(daily.keys()) if daily else None)
+
+        dh_snaps, dh_latest_date = get_snaps(dh_s)
+        dc_snaps, dc_latest_date = get_snaps(dc_s)
+
+        all_snap_dates = KNOWN_SNAP_DATES + [str(dh_latest_date or today)]
+
+        def deltas(snaps):
+            # 5 monthly periods + current MTD
+            # Oct = snap[1]-snap[0], Nov = snap[2]-snap[1], ...
+            # Jan = snap[5]-snap[4] (skip Jan1 -> use billing year)
+            # Feb = snap[6]-snap[5]
+            # Mar MTD = snap[7]-snap[6]
+            out = []
+            pairs = [(0,1),(1,2),(2,3),(4,5),(5,6),(6,7)]
+            for a, b in pairs:
+                va = snaps[a] if snaps[a] is not None else 0
+                vb = snaps[b] if snaps[b] is not None else 0
+                out.append(round(max(0, vb - va), 4))
+            return out
+
+        dh_d = deltas(dh_snaps)
+        dc_d = deltas(dc_snaps)
+
+        # YTD from Jan 1
+        dh_cur = round(max(0, (dh_snaps[7] or 0) - (dh_snaps[4] or 0)), 4)
+        dc_cur = round(max(0, (dc_snaps[7] or 0) - (dc_snaps[4] or 0)), 4)
+
+        # Daily deltas
+        def daily_deltas(serial):
+            daily = daily_data.get(serial, {})
+            if not daily:
+                return {}
+            sorted_dates = sorted(daily.keys())
+            result = {}
+            for i in range(1, len(sorted_dates)):
+                d0, d1 = sorted_dates[i-1], sorted_dates[i]
+                delta = round(max(0, daily[d1] - daily[d0]), 4)
+                result[d1] = delta
+            return result
+
+        dh_daily = daily_deltas(dh_s)
+        dc_daily = daily_deltas(dc_s)
+        daily_merged = {}
+        all_days = sorted(set(dh_daily) | set(dc_daily))
+        for d in all_days:
+            daily_merged[d] = {"dh": dh_daily.get(d, 0), "dc": dc_daily.get(d, 0)}
+
+        # Cumulative arrays (for YTD line chart)
+        dh_cum = [round(v, 4) if v is not None else None for v in dh_snaps]
+        dc_cum = [round(v, 4) if v is not None else None for v in dc_snaps]
+
+        units_out.append({
+            "u": uid,
+            "f": u["f"],
+            "dh": dh_d,
+            "dc": dc_d,
+            "dh_cur": dh_cur,
+            "dc_cur": dc_cur,
+            "dh_s": dh_s,
+            "dc_s": dc_s,
+            "snap_dates": all_snap_dates,
+            "dh_cum": dh_cum,
+            "dc_cum": dc_cum,
+            "daily": daily_merged,
+        })
+
+    log.info(f"Built data for {len(units_out)} units")
+    return units_out
+
+# ── Step 5: Inject into index.html ────────────────────────────────────────────
+def build_html(units_out):
+    if not TEMPLATE.exists():
+        log.error(f"Template not found: {TEMPLATE}")
+        return
+
+    with open(TEMPLATE, "r", encoding="utf-8") as f:
+        html = f.read()
+
+    today = date.today()
+    latest_date = max(
+        (max(u["daily"].keys()) for u in units_out if u["daily"]),
+        default=str(today)
+    )
+
+    payload = json.dumps({
+        "units": units_out,
+        "status": "ok",
+        "stale": False,
+        "last_sync": latest_date,
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+    }, separators=(",", ":"))
+
+    # Replace placeholder in template
+    html = html.replace("__SEED_DATA_JSON__", payload)
+
+    with open(INDEX_HTML, "w", encoding="utf-8") as f:
+        f.write(html)
+
+    log.info(f"Built {INDEX_HTML} ({INDEX_HTML.stat().st_size:,} bytes)")
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    log.info("=== Oxford Dashboard Build ===")
+    sftp_sync()
+    meter_list, serial_to_unit = load_meter_map()
+    if not meter_list:
+        log.error("No meter map — aborting")
+        exit(1)
+    snapshot_data, daily_data = parse_csvs(serial_to_unit)
+    units_out = build_unit_data(meter_list, serial_to_unit, snapshot_data, daily_data)
+    build_html(units_out)
+    log.info("=== Done ===")
